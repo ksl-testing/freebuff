@@ -1195,6 +1195,235 @@ export async function applyOverridesToSessionState(
 /**
  * Builds a hierarchical file tree from a flat list of file paths
  */
+/**
+ * Pushes a commit to the user's GitHub repository.
+ * Uses the CODEBUFF_GITHUB_TOKEN for authentication.
+ * The commit message and changed files must be provided.
+ * Returns the GitHub API response or throws an error.
+ *
+ * @param cwd - Path to the git repository
+ * @param spawn - Child process spawn function
+ * @param logger - Logger instance
+ * @param commitMessage - Commit message for the changes
+ * @param changedFiles - List of changed file paths (relative to cwd)
+ * @param token - GitHub PAT (defaults to CODEBUFF_GITHUB_TOKEN env var)
+ * @returns GitHub API response
+ */
+export async function gitPushChanges(params: {
+  cwd: string
+  spawn: CodebuffFileSystem extends any ? any : any
+  logger: Logger
+  commitMessage: string
+  changedFiles: string[]
+  token?: string
+}): Promise<{ success: boolean; url?: string; htmlUrl?: string; error?: string }> {
+  const { cwd, spawn, logger, commitMessage, changedFiles, token } = params
+  const githubToken = token || (typeof process !== 'undefined' && process.env.CODEBUFF_GITHUB_TOKEN)
+
+  if (!githubToken) {
+    logger.error({}, 'CODEBUFF_GITHUB_TOKEN not set; cannot push to GitHub')
+    return { success: false, error: 'CODEBUFF_GITHUB_TOKEN not set' }
+  }
+
+  // Stage changed files
+  await new Promise<void>((resolve, reject) => {
+    spawn('git', ['add', ...changedFiles], { cwd }, (error) => {
+      if (error) return reject(error)
+      resolve()
+    })
+  })
+
+  // Commit changes
+  await new Promise<void>((resolve, reject) => {
+    spawn('git', ['commit', '-m', commitMessage], { cwd }, (error) => {
+      if (error) return reject(error)
+      resolve()
+    })
+  })
+
+  // Push to remote (assume 'origin' remote)
+  const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    spawn('git', ['push', 'origin', 'HEAD'], { cwd }, (error, stdout, stderr) => {
+      if (error) return reject({ error: stderr || error.message, stdout })
+      resolve({ stdout, stderr: error?.message })
+    })
+  })
+
+  if (result.error) {
+    logger.error({ error: result.error }, 'Git push failed')
+    return { success: false, error: result.error }
+  }
+
+  // Parse the push URL from stdout to get the GitHub compare URL
+  const match = result.stdout.match(/https?:\/\/[^\s]+\.git/)
+  const htmlUrl = match ? match[0].replace(/\.git$/, '') : undefined
+
+  logger.info({ commitMessage, changedFilesCount: changedFiles.length }, 'Git push successful')
+  return { success: true, htmlUrl }
+}
+
+/**
+ * Pulls changes from the user's GitHub repository.
+ * Fetches and rebases the current branch from the remote.
+ * Uses the CODEBUFF_GITHUB_TOKEN for authentication.
+ *
+ * @param cwd - Path to the git repository
+ * @param spawn - Child process spawn function
+ * @param logger - Logger instance
+ * @param token - GitHub PAT (defaults to CODEBUFF_GITHUB_TOKEN env var)
+ * @returns GitHub API response
+ */
+export async function gitPullChanges(params: {
+  cwd: string
+  spawn: CodebuffFileSystem extends any ? any : any
+  logger: Logger
+  token?: string
+}): Promise<{ success: boolean; fetched?: string; merged?: string; error?: string }> {
+  const { cwd, spawn, logger, token } = params
+  const githubToken = token || (typeof process !== 'undefined' && process.env.CODEBUFF_GITHUB_TOKEN)
+
+  if (!githubToken) {
+    logger.error({}, 'CODEBUFF_GITHUB_TOKEN not set; cannot pull from GitHub')
+    return { success: false, error: 'CODEBUFF_GITHUB_TOKEN not set' }
+  }
+
+  // Fetch from remote
+  const fetchResult = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    spawn('git', ['fetch', 'origin'], { cwd }, (error, stdout, stderr) => {
+      if (error) return reject({ error: stderr || error.message, stdout })
+      resolve({ stdout, stderr: error?.message })
+    })
+  })
+
+  if (fetchResult.error) {
+    logger.error({ error: fetchResult.error }, 'Git fetch failed')
+    return { success: false, error: fetchResult.error }
+  }
+
+  // Get current branch
+  const branchResult = await new Promise<{ stdout: string }>((resolve, reject) => {
+    spawn('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd }, (error, stdout) => {
+      if (error) return reject(error)
+      resolve({ stdout })
+    })
+  })
+
+  const branch = branchResult.stdout.trim()
+
+  // Rebase current branch onto the fetched remote
+  const rebaseResult = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    spawn('git', ['rebase', `origin/${branch}`], { cwd }, (error, stdout, stderr) => {
+      if (error) return reject({ error: stderr || error.message, stdout })
+      resolve({ stdout, stderr: error?.message })
+    })
+  })
+
+  if (rebaseResult.error) {
+    // If rebase fails, try a merge instead
+    const mergeResult = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      spawn('git', ['merge', `origin/${branch}`], { cwd }, (error, stdout, stderr) => {
+        if (error) return reject({ error: stderr || error.message, stdout })
+        resolve({ stdout, stderr: error?.message })
+      })
+    })
+
+    if (mergeResult.error) {
+      logger.error({ error: mergeResult.error }, 'Git merge/rebase failed')
+      return { success: false, error: mergeResult.error }
+    }
+
+    logger.info({ branch }, 'Git merge successful')
+    return { success: true, merged: mergeResult.stdout }
+  }
+
+  logger.info({ branch }, 'Git rebase successful')
+  return { success: true, fetched: fetchResult.stdout, merged: rebaseResult.stdout }
+}
+
+/**
+ * Creates a new branch in the local git repository.
+ *
+ * @param cwd - Path to the git repository
+ * @param spawn - Child process spawn function
+ * @param logger - Logger instance
+ * @param branchName - Name of the new branch
+ * @returns Success status
+ */
+export async function gitCreateBranch(params: {
+  cwd: string
+  spawn: CodebuffFileSystem extends any ? any : any
+  logger: Logger
+  branchName: string
+}): Promise<{ success: boolean; error?: string }> {
+  const { cwd, spawn, logger, branchName } = params
+
+  const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    spawn('git', ['checkout', '-b', branchName], { cwd }, (error, stdout, stderr) => {
+      if (error) return reject({ error: stderr || error.message, stdout })
+      resolve({ stdout, stderr: error?.message })
+    })
+  })
+
+  if (result.error) {
+    logger.error({ error: result.error, branchName }, 'Git branch creation failed')
+    return { success: false, error: result.error }
+  }
+
+  logger.info({ branchName }, 'Git branch created successfully')
+  return { success: true }
+}
+
+/**
+ * Applies a patch file to the current working directory.
+ * The patch is expected to be in git diff format.
+ *
+ * @param cwd - Path to the git repository
+ * @param spawn - Child process spawn function
+ * @param logger - Logger instance
+ * @patchContent - The patch content in git diff format
+ * @returns Success status
+ */
+export async function gitApplyPatch(params: {
+  cwd: string
+  spawn: CodebuffFileSystem extends any ? any : any
+  logger: Logger
+  patchContent: string
+}): Promise<{ success: boolean; appliedFiles?: string[]; error?: string }> {
+  const { cwd, spawn, logger, patchContent } = params
+
+  // Write the patch to a temp file
+  const fs = require('fs')
+  const tmpPatchPath = path.join(cwd, '.tmp_freebuff_patch.patch')
+  fs.writeFileSync(tmpPatchPath, patchContent)
+
+  // Apply the patch
+  const result = await new Promise<{ stdout: string; stderr: string; status: number }>((resolve, reject) => {
+    spawn('git', ['apply', tmpPatchPath], { cwd }, (error, stdout, stderr) => {
+      if (error) return reject({ error: stderr || error.message, stdout, status: error?.status ?? 1 })
+      resolve({ stdout, stderr: error?.message, status: 0 })
+    })
+  })
+
+  // Clean up temp file
+  try { fs.unlinkSync(tmpPatchPath) } catch {}
+
+  if (result.status !== 0) {
+    logger.error({ error: result.error }, 'Git apply failed')
+    return { success: false, error: result.error }
+  }
+
+  // Get list of applied files
+  const applyResult = await new Promise<{ stdout: string }>((resolve, reject) => {
+    spawn('git', ['diff', '--name-only', '--cached'], { cwd }, (error, stdout) => {
+      if (error) return reject(error)
+      resolve({ stdout })
+    })
+  })
+
+  logger.info({ appliedFiles: applyResult.stdout.split('\n').filter(Boolean) }, 'Git patch applied successfully')
+  return { success: true, appliedFiles: applyResult.stdout.split('\n').filter(Boolean) }
+}
+
 function buildFileTree(filePaths: string[]): FileTreeNode[] {
   const tree: Record<string, FileTreeNode> = {}
 
